@@ -1,4 +1,5 @@
 config_secrets.py
 oauth_token.json
+main_backup.py
 *.pyc
 __pycache__/

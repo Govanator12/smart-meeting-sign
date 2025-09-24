@@ -1,4 +1,4 @@
-# main.py - Meeting Light Controller with OAuth2 (Active-LOW Relay Version)
+# main.py - Meeting Light Controller with improved WiFi handling and logging
 import network
 import urequests as requests
 import ujson as json
@@ -10,6 +10,7 @@ import ntptime
 # Import configuration and OAuth handler
 from config import *
 from oauth_handler import OAuth2Handler
+from logger import Logger
 
 # Enable garbage collection
 gc.enable()
@@ -17,136 +18,254 @@ gc.collect()
 
 class MeetingLight:
     def __init__(self):
+        # Initialize logger first
+        self.logger = Logger()
+        self.logger.info("="*50)
+        self.logger.info("Meeting Light Controller Starting...")
+        self.logger.info(f"Free memory: {gc.mem_free()} bytes")
+
         # Initialize hardware
         self.relay = machine.Pin(RELAY_PIN, machine.Pin.OUT)
         self.led = machine.Pin(LED_PIN, machine.Pin.OUT)
         self.relay.on()  # Active-LOW: on() = relay OFF (light off at startup)
         self.led.off()
-        
+
         # State tracking
         self.events_cache = []
         self.last_calendar_fetch = 0
         self.in_meeting = False
         self.wifi_connected = False
-        
+        self.wifi_reconnect_attempts = 0
+        self.wifi_reconnect_delay = 5  # Initial reconnect delay in seconds
+        self.max_wifi_reconnect_delay = 300  # Max delay of 5 minutes
+        self.last_wifi_check = 0
+        self.wifi_check_interval = 60  # Check WiFi every 60 seconds
+
+        # Error tracking
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 5
+
+        # Initialize watchdog timer (8 seconds timeout)
+        try:
+            self.wdt = machine.WDT(timeout=8000)
+            self.logger.info("Watchdog timer initialized (8s timeout)")
+        except:
+            self.logger.warning("Watchdog timer not available")
+            self.wdt = None
+
         # Connect to WiFi first
         self.connect_wifi()
-        
+
         # Sync time (needed for OAuth2)
         self.sync_time()
-        
+
         # Initialize OAuth2 handler
-        print("Initializing OAuth2...")
-        self.oauth = OAuth2Handler(
-            CLIENT_ID,
-            CLIENT_SECRET,
-            CALENDAR_SCOPE,
-            TOKEN_FILE
-        )
-        
-        # Test OAuth2 connection
-        if not self.oauth.get_valid_token():
-            print("❌ Failed to authenticate with Google")
+        self.logger.info("Initializing OAuth2...")
+        try:
+            self.oauth = OAuth2Handler(
+                CLIENT_ID,
+                CLIENT_SECRET,
+                CALENDAR_SCOPE,
+                TOKEN_FILE
+            )
+
+            # Test OAuth2 connection
+            if not self.oauth.get_valid_token():
+                self.logger.error("Failed to authenticate with Google")
+                self.error_flash()
+            else:
+                self.logger.info("Google Calendar connected successfully!")
+        except Exception as e:
+            self.logger.error(f"OAuth initialization failed: {e}")
             self.error_flash()
-        else:
-            print("✅ Google Calendar connected!")
-    
-    def connect_wifi(self):
-        """Connect to WiFi network with proper reset"""
-        print(f"Connecting to WiFi: {WIFI_SSID}")
-        
+
+    def feed_watchdog(self):
+        """Feed the watchdog timer to prevent reset"""
+        if self.wdt:
+            try:
+                self.wdt.feed()
+            except:
+                pass
+
+    def connect_wifi(self, force_reconnect=False):
+        """Connect to WiFi network with exponential backoff"""
+        self.logger.info(f"Connecting to WiFi: {WIFI_SSID} (attempt {self.wifi_reconnect_attempts + 1})")
+
         try:
             # Reset WiFi first to ensure clean state
             try:
-                temp_wlan = network.WLAN(network.STA_IF)
-                temp_wlan.active(False)
-                temp_wlan.deinit()
-                time.sleep(1)
+                if hasattr(self, 'wlan'):
+                    self.wlan.active(False)
+                    self.wlan.disconnect()
+                    time.sleep(1)
             except:
                 pass
-                
-            # Now create fresh WiFi connection
+
+            # Create fresh WiFi connection
             self.wlan = network.WLAN(network.STA_IF)
             self.wlan.active(False)
             time.sleep(0.5)
             self.wlan.active(True)
             time.sleep(0.5)
-            
-            if self.wlan.isconnected():
-                self.wlan.disconnect()
-                time.sleep(1)
-            
+
+            # Set WiFi power saving mode off for better reliability
+            try:
+                self.wlan.config(pm=0xa11140)  # Disable power saving
+            except:
+                pass
+
+            # Connect to WiFi
             self.wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-            
-            max_attempts = 20
-            attempt = 0
-            while not self.wlan.isconnected() and attempt < max_attempts:
+
+            # Wait for connection with timeout
+            max_wait = 30  # 30 seconds timeout
+            wait_count = 0
+            while not self.wlan.isconnected() and wait_count < max_wait:
                 self.blink_led(1, 0.2)
-                print(".", end="")
-                attempt += 1
+                self.feed_watchdog()
+                wait_count += 1
                 time.sleep(1)
-            
+
+                # Log progress every 5 seconds
+                if wait_count % 5 == 0:
+                    self.logger.info(f"WiFi connecting... ({wait_count}s)")
+
             if self.wlan.isconnected():
                 self.wifi_connected = True
-                print(f"\n✅ WiFi connected! IP: {self.wlan.ifconfig()[0]}")
+                self.wifi_reconnect_attempts = 0
+                self.wifi_reconnect_delay = 5  # Reset delay on successful connection
+                ip_info = self.wlan.ifconfig()
+                self.logger.info(f"WiFi connected! IP: {ip_info[0]}")
+                self.logger.info(f"Signal strength: {self.get_wifi_signal()} dBm")
                 self.led.on()
                 time.sleep(1)
                 self.led.off()
+                return True
             else:
-                print("\n❌ WiFi connection failed!")
-                time.sleep(2)
-                machine.reset()
-                
+                self.wifi_connected = False
+                self.wifi_reconnect_attempts += 1
+                self.logger.error(f"WiFi connection failed (attempt {self.wifi_reconnect_attempts})")
+
+                # Exponential backoff with max delay
+                current_delay = min(self.wifi_reconnect_delay * (2 ** (self.wifi_reconnect_attempts - 1)),
+                                  self.max_wifi_reconnect_delay)
+                self.logger.info(f"Will retry WiFi connection in {current_delay} seconds...")
+
+                # Wait with watchdog feeding
+                for i in range(int(current_delay)):
+                    self.feed_watchdog()
+                    time.sleep(1)
+
+                return False
+
         except Exception as e:
-            print(f"WiFi error: {e}")
-            time.sleep(2)
-            machine.reset()
-    
+            self.logger.error(f"WiFi connection error: {e}")
+            self.wifi_reconnect_attempts += 1
+
+            # Exponential backoff on exception too
+            current_delay = min(self.wifi_reconnect_delay * (2 ** (self.wifi_reconnect_attempts - 1)),
+                              self.max_wifi_reconnect_delay)
+            self.logger.info(f"Will retry WiFi connection in {current_delay} seconds...")
+
+            for i in range(int(current_delay)):
+                self.feed_watchdog()
+                time.sleep(1)
+
+            return False
+
+    def get_wifi_signal(self):
+        """Get WiFi signal strength"""
+        try:
+            if hasattr(self.wlan, 'status'):
+                return self.wlan.status('rssi')
+            return "N/A"
+        except:
+            return "N/A"
+
+    def check_wifi_connection(self):
+        """Periodically check WiFi connection and reconnect if needed"""
+        current_time = time.time()
+
+        if current_time - self.last_wifi_check < self.wifi_check_interval:
+            return True
+
+        self.last_wifi_check = current_time
+
+        try:
+            if not self.wlan.isconnected():
+                self.logger.warning("WiFi disconnected, attempting reconnection...")
+                self.wifi_connected = False
+
+                # Keep trying to reconnect with exponential backoff
+                while not self.wlan.isconnected():
+                    if self.connect_wifi(force_reconnect=True):
+                        self.sync_time()
+                        return True
+                    # connect_wifi handles the backoff delay
+                return False
+            else:
+                # WiFi is connected, check signal strength
+                signal = self.get_wifi_signal()
+                if signal != "N/A" and signal < -80:
+                    self.logger.warning(f"Weak WiFi signal: {signal} dBm")
+
+                return True
+        except Exception as e:
+            self.logger.error(f"WiFi check error: {e}")
+            return False
+
     def sync_time(self):
-        """Sync time via NTP (required for OAuth2)"""
-        print("Syncing time...")
-        max_attempts = 3
-        
+        """Sync time via NTP with better error handling"""
+        self.logger.info("Syncing time via NTP...")
+        max_attempts = 5
+
         for attempt in range(max_attempts):
             try:
+                self.feed_watchdog()
                 ntptime.settime()
                 t = time.localtime()
-                print(f"✓ Time synced: {t[0]}-{t[1]:02d}-{t[2]:02d} {t[3]:02d}:{t[4]:02d}:{t[5]:02d}")
+                self.logger.info(f"Time synced: {t[0]}-{t[1]:02d}-{t[2]:02d} {t[3]:02d}:{t[4]:02d}:{t[5]:02d} UTC")
                 return True
-            except:
+            except Exception as e:
                 if attempt < max_attempts - 1:
-                    print(f"Time sync attempt {attempt + 1} failed, retrying...")
+                    self.logger.warning(f"NTP sync attempt {attempt + 1} failed: {e}, retrying...")
                     time.sleep(2)
-        
-        print("Warning: Time sync failed - OAuth may not work correctly")
+                else:
+                    self.logger.error(f"NTP sync failed after {max_attempts} attempts")
+
         return False
-    
+
     def fetch_calendar_events(self):
-        """Fetch and cache calendar events using OAuth2"""
-        print("\n📅 Fetching calendar events...")
+        """Fetch and cache calendar events with improved error handling"""
+        self.logger.info("Fetching calendar events...")
         self.blink_led(3, 0.1)
-        
-        # Get valid OAuth2 token
-        token = self.oauth.get_valid_token()
-        if not token:
-            print("❌ Could not get valid auth token")
-            return
-        
+        self.feed_watchdog()
+
         try:
+            # Check WiFi before fetching
+            if not self.check_wifi_connection():
+                self.logger.error("Cannot fetch calendar - WiFi not connected")
+                return False
+
+            # Get valid OAuth2 token
+            token = self.oauth.get_valid_token()
+            if not token:
+                self.logger.error("Could not get valid auth token")
+                self.consecutive_errors += 1
+                return False
+
             # Get current time for date range (in UTC)
             now = time.localtime()
             year, month, day = now[0], now[1], now[2]
-            
+
             # Create time range for next 48 hours in UTC
-            # Start from now
             time_min = f"{year:04d}-{month:02d}-{day:02d}T{now[3]:02d}:{now[4]:02d}:00Z"
-            
+
             # Calculate end time (48 hours from now)
-            # Simple approach: add 2 days (won't be exact for month boundaries but close enough)
             end_day = day + 2
             end_month = month
             end_year = year
-            
+
             # Handle month overflow (simplified)
             if end_day > 28:  # Safe for all months
                 if month == 2:  # February
@@ -161,93 +280,100 @@ class MeetingLight:
                     if end_day > 31:
                         end_day = end_day - 31
                         end_month = month + 1
-            
+
             # Handle year overflow
             if end_month > 12:
                 end_month = 1
                 end_year = year + 1
-            
+
             time_max = f"{end_year:04d}-{end_month:02d}-{end_day:02d}T{now[3]:02d}:{now[4]:02d}:00Z"
-            
-            print(f"Fetching events from now until {end_year}-{end_month:02d}-{end_day:02d}")
-            
-            # Build Calendar API request - REQUEST UTC TIMES
+
+            self.logger.info(f"Fetching events from {time_min} to {time_max}")
+
+            # Build Calendar API request
             url = f"https://www.googleapis.com/calendar/v3/calendars/{CALENDAR_ID}/events"
             params = (f"?timeMin={time_min}&timeMax={time_max}"
                      f"&singleEvents=true&orderBy=startTime&maxResults=50"
-                     f"&timeZone=UTC")  # Force UTC timezone
-            
+                     f"&timeZone=UTC")
+
             headers = {
                 'Authorization': f'Bearer {token}',
                 'Accept': 'application/json'
             }
-            
-            # Make API request
+
+            self.feed_watchdog()
+
+            # Make API request with timeout
             response = requests.get(url + params, headers=headers)
             data = response.json()
             response.close()
             gc.collect()
-            
+
+            self.feed_watchdog()
+
             # Check for API errors
             if 'error' in data:
                 error_code = data['error'].get('code', 0)
                 error_msg = data['error'].get('message', 'Unknown error')
-                print(f"API Error {error_code}: {error_msg}")
-                
-                # If unauthorized, try refreshing token
+                self.logger.error(f"API Error {error_code}: {error_msg}")
+
                 if error_code == 401:
-                    print("Token expired, refreshing...")
+                    self.logger.info("Token expired, refreshing...")
                     self.oauth.refresh_access_token()
-                return
-            
+
+                self.consecutive_errors += 1
+                return False
+
             # Process events
             self.events_cache = []
             items = data.get('items', [])
-            
+
             if not items:
-                print("No events found for next 48 hours")
-                return
-            
-            print(f"Found {len(items)} total events in next 48 hours")
-            
-            for event in items:
-                # Check if we should skip this event
-                if self.should_skip_event(event):
-                    continue
-                
-                # Get event times (now in UTC)
-                start_str = event.get('start', {}).get('dateTime', '')
-                end_str = event.get('end', {}).get('dateTime', '')
-                
-                if start_str and end_str:
-                    processed_event = {
-                        'summary': event.get('summary', 'No title')[:50],  # Limit length
-                        'start': self.parse_time_utc(start_str),
-                        'end': self.parse_time_utc(end_str)
-                    }
-                    self.events_cache.append(processed_event)
-                    
-                    # Show date and time in local for display
-                    event_date = start_str.split('T')[0]
-                    event_time = start_str.split('T')[1][:5] if 'T' in start_str else ''
-                    today_date = f"{year:04d}-{month:02d}-{day:02d}"
-                    if event_date == today_date:
-                        print(f"  📌 Today {event_time} UTC: {processed_event['summary']}")
-                    else:
-                        print(f"  📌 {event_date} {event_time} UTC: {processed_event['summary']}")
-            
+                self.logger.info("No events found for next 48 hours")
+            else:
+                self.logger.info(f"Found {len(items)} total events")
+
+                for event in items:
+                    if self.should_skip_event(event):
+                        continue
+
+                    start_str = event.get('start', {}).get('dateTime', '')
+                    end_str = event.get('end', {}).get('dateTime', '')
+
+                    if start_str and end_str:
+                        processed_event = {
+                            'summary': event.get('summary', 'No title')[:50],
+                            'start': self.parse_time_utc(start_str),
+                            'end': self.parse_time_utc(end_str)
+                        }
+                        self.events_cache.append(processed_event)
+
+                        event_date = start_str.split('T')[0]
+                        event_time = start_str.split('T')[1][:5] if 'T' in start_str else ''
+                        today_date = f"{year:04d}-{month:02d}-{day:02d}"
+                        if event_date == today_date:
+                            self.logger.info(f"  Today {event_time} UTC: {processed_event['summary']}")
+                        else:
+                            self.logger.info(f"  {event_date} {event_time} UTC: {processed_event['summary']}")
+
             self.last_calendar_fetch = time.time()
-            print(f"✓ Cached {len(self.events_cache)} relevant events")
+            self.logger.info(f"Cached {len(self.events_cache)} relevant events")
+            self.consecutive_errors = 0  # Reset error counter on success
             gc.collect()
-            
+            return True
+
         except MemoryError:
-            print("Memory error - reducing cache size")
+            self.logger.error("Memory error - reducing cache size")
             self.events_cache = self.events_cache[:10]
             gc.collect()
+            self.consecutive_errors += 1
+            return False
         except Exception as e:
-            print(f"Calendar fetch error: {e}")
+            self.logger.error(f"Calendar fetch error: {e}")
             self.error_flash()
-    
+            self.consecutive_errors += 1
+            return False
+
     def should_skip_event(self, event):
         """Check if event should be skipped based on filters"""
         # Skip declined events
@@ -256,89 +382,83 @@ class MeetingLight:
             for attendee in attendees:
                 if attendee.get('self', False):
                     if attendee.get('responseStatus') == 'declined':
-                        print(f"  ⏭️  Skipping (declined): {event.get('summary', '')[:30]}")
+                        self.logger.debug(f"Skipping declined: {event.get('summary', '')[:30]}")
                         return True
-        
+
         # Skip all-day events
         if IGNORE_ALL_DAY and 'date' in event.get('start', {}):
-            print(f"  ⏭️  Skipping (all-day): {event.get('summary', '')[:30]}")
+            self.logger.debug(f"Skipping all-day: {event.get('summary', '')[:30]}")
             return True
-        
+
         # Skip Personal Work (tangerine color) events
         if event.get('colorId') == PERSONAL_WORK_COLOR_ID:
-            print(f"  ⏭️  Skipping (personal/tangerine): {event.get('summary', '')[:30]}")
+            self.logger.debug(f"Skipping personal: {event.get('summary', '')[:30]}")
             return True
-        
+
         # Skip Focus Time (banana color) events
         if event.get('colorId') == FOCUS_TIME_COLOR_ID:
-            print(f"  ⏭️  Skipping (focus/banana): {event.get('summary', '')[:30]}")
+            self.logger.debug(f"Skipping focus: {event.get('summary', '')[:30]}")
             return True
-        
+
         # Skip OOO events
         if IGNORE_OOO:
-            # Check event type
             if event.get('eventType') == 'outOfOffice':
-                print(f"  ⏭️  Skipping (OOO type): {event.get('summary', '')[:30]}")
+                self.logger.debug(f"Skipping OOO: {event.get('summary', '')[:30]}")
                 return True
-            
-            # Check transparency
+
             if event.get('transparency') == 'transparent':
-                print(f"  ⏭️  Skipping (transparent): {event.get('summary', '')[:30]}")
+                self.logger.debug(f"Skipping transparent: {event.get('summary', '')[:30]}")
                 return True
-            
-            # Check summary text as fallback
+
             summary_lower = event.get('summary', '').lower()
             if any(term in summary_lower for term in ['ooo', 'out of office', 'vacation']):
-                print(f"  ⏭️  Skipping (OOO text): {event.get('summary', '')[:30]}")
+                self.logger.debug(f"Skipping OOO text: {event.get('summary', '')[:30]}")
                 return True
-        
+
         return False
-    
+
     def parse_time_utc(self, time_str):
         """Parse ISO time string to epoch seconds (expecting UTC times)"""
         try:
-            # Format: 2024-01-15T10:30:00Z (Z means UTC)
-            # Or: 2024-01-15T10:30:00-05:00 (with timezone offset)
             date_part = time_str.split('T')[0]
             time_part = time_str.split('T')[1][:8]
-            
+
             year, month, day = map(int, date_part.split('-'))
             hour, minute, second = map(int, time_part.split(':'))
-            
-            # Convert to epoch (Pico is now in UTC after NTP sync)
+
             return time.mktime((year, month, day, hour, minute, second, 0, 0))
         except Exception as e:
-            print(f"Time parse error: {e} for {time_str}")
+            self.logger.error(f"Time parse error: {e} for {time_str}")
             return 0
-    
+
     def check_meeting_status(self):
         """Check if currently in a meeting based on cached events"""
         now = time.localtime()
         current_time = time.mktime(now)
-        
+
         buffer_seconds = MEETING_BUFFER_MINUTES * 60
-        
+
         for event in self.events_cache:
             meeting_start = event['start'] - buffer_seconds  # Start early
             meeting_end = event['end'] + buffer_seconds      # End late
-            
+
             if meeting_start <= current_time <= meeting_end:
                 if not self.in_meeting:
-                    print(f"\n🔴 MEETING ON: {event['summary']}")
+                    self.logger.info(f"MEETING STARTED: {event['summary']}")
                     self.in_meeting = True
                     self.relay.off()  # Active-LOW: off() = relay ON (light ON)
                     self.led.on()  # Solid LED during meeting
                 return True
-        
+
         # No active meetings
         if self.in_meeting:
-            print("\n🟢 MEETING OFF")
+            self.logger.info("MEETING ENDED")
             self.in_meeting = False
             self.relay.on()  # Active-LOW: on() = relay OFF (light OFF)
             self.led.off()
-        
+
         return False
-    
+
     def blink_led(self, times, duration):
         """Blink the built-in LED"""
         for _ in range(times):
@@ -346,7 +466,7 @@ class MeetingLight:
             time.sleep(duration)
             self.led.off()
             time.sleep(duration)
-    
+
     def error_flash(self):
         """Flash relay/LED to indicate error"""
         for _ in range(3):
@@ -356,58 +476,73 @@ class MeetingLight:
             self.relay.on()  # Active-LOW: on() = relay OFF
             self.led.off()
             time.sleep(1)
-    
+
     def run(self):
-        """Main loop"""
-        print("\n🚀 Starting Meeting Light Controller...")
-        print("="*50)
-        
+        """Main loop with improved error handling"""
+        self.logger.info("Starting main loop...")
+        self.logger.info("="*50)
+
         # Initial calendar fetch
         self.fetch_calendar_events()
-        
+
         last_status_check = 0
         last_gc = 0
-        
+        last_health_log = 0
+        health_log_interval = 300  # Log health status every 5 minutes
+
         while True:
             try:
+                self.feed_watchdog()
                 current_time = time.time()
-                
+
                 # Garbage collection every minute
                 if current_time - last_gc >= 60:
                     gc.collect()
                     last_gc = current_time
-                
-                # Refresh calendar every 15 minutes
+
+                # Health status logging
+                if current_time - last_health_log >= health_log_interval:
+                    free_mem = gc.mem_free()
+                    signal = self.get_wifi_signal()
+                    self.logger.info(f"Health check - Memory: {free_mem} bytes, WiFi: {signal} dBm, In meeting: {self.in_meeting}")
+                    last_health_log = current_time
+
+                # Check for too many consecutive errors (but not WiFi errors, those use backoff)
+                if self.consecutive_errors >= self.max_consecutive_errors:
+                    self.logger.error(f"Too many consecutive API/OAuth errors ({self.consecutive_errors})")
+                    self.logger.info("Will continue retrying with exponential backoff...")
+                    # Reset error counter but don't reset device
+                    self.consecutive_errors = 0
+
+                # Refresh calendar
                 if current_time - self.last_calendar_fetch >= CALENDAR_REFRESH_INTERVAL:
-                    self.fetch_calendar_events()
-                
-                # Check meeting status every 10 seconds
+                    if not self.fetch_calendar_events():
+                        # If fetch failed, try again in 60 seconds
+                        self.last_calendar_fetch = current_time - CALENDAR_REFRESH_INTERVAL + 60
+
+                # Check meeting status
                 if current_time - last_status_check >= STATUS_CHECK_INTERVAL:
                     if not self.in_meeting:
                         # Quick blink when checking (only if not in meeting)
                         self.blink_led(1, 0.05)
                     self.check_meeting_status()
                     last_status_check = current_time
-                
-                # Check WiFi connection
-                if not self.wlan.isconnected():
-                    print("WiFi disconnected, reconnecting...")
-                    self.wifi_connected = False
-                    self.wlan.active(False)
-                    time.sleep(1)
-                    self.connect_wifi()
-                    self.sync_time()
-                
+
+                # Check WiFi connection periodically
+                self.check_wifi_connection()
+
                 time.sleep(1)
-                
+
             except MemoryError:
-                print("Memory error - restarting...")
+                self.logger.error("Memory error in main loop, restarting...")
+                time.sleep(2)
                 machine.reset()
             except KeyboardInterrupt:
-                print("\nStopped by user")
+                self.logger.info("Stopped by user")
                 break
             except Exception as e:
-                print(f"Error in main loop: {e}")
+                self.logger.error(f"Error in main loop: {e}")
+                self.consecutive_errors += 1
                 self.error_flash()
                 time.sleep(10)
 
@@ -417,7 +552,7 @@ if __name__ == "__main__":
         controller = MeetingLight()
         controller.run()
     except KeyboardInterrupt:
-        print("\n👋 Goodbye!")
+        print("\nStopped by user")
     except Exception as e:
         print(f"Fatal error: {e}")
         time.sleep(5)
