@@ -3,3 +3,4 @@ oauth_token.json
 main_backup.py
 *.pyc
 __pycache__/
+.claude/
