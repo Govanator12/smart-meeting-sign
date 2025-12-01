@@ -25,6 +25,20 @@ class MeetingLight:
         self.logger.info("Meeting Light Controller Starting (with Web UI)...")
         self.logger.info(f"Free memory: {gc.mem_free()} bytes")
 
+        # Log reset cause for diagnostics
+        reset_cause = machine.reset_cause()
+        reset_reasons = {
+            machine.PWRON_RESET: "Power-on reset",
+            machine.HARD_RESET: "Hard reset (button press)",
+            machine.WDT_RESET: "Watchdog timer reset (system hang detected)",
+            machine.SOFT_RESET: "Soft reset (Ctrl+D or software reset)"
+        }
+        if hasattr(machine, 'DEEPSLEEP_RESET'):
+            reset_reasons[machine.DEEPSLEEP_RESET] = "Deep sleep wake"
+
+        reset_reason = reset_reasons.get(reset_cause, f"Unknown reset cause: {reset_cause}")
+        self.logger.info(f"Reset cause: {reset_reason}")
+
         # Initialize hardware
         self.relay = machine.Pin(RELAY_PIN, machine.Pin.OUT)
         self.led = machine.Pin(LED_PIN, machine.Pin.OUT)
@@ -36,6 +50,7 @@ class MeetingLight:
         self.last_calendar_fetch = 0
         self.in_meeting = False
         self.relay_state = "OFF"  # Track relay state for logging
+        self.logger.info(f"Initial relay state: {self.relay_state} (boot initialization)")
         self.wifi_connected = False
         self.wifi_reconnect_attempts = 0
         self.wifi_reconnect_delay = 5  # Initial reconnect delay in seconds
