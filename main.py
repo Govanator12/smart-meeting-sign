@@ -1,4 +1,4 @@
-# main.py - Meeting Light Controller with improved WiFi handling and logging
+# main.py - Meeting Light Controller with WiFi resilience, relay state logging, and web UI
 import network
 import urequests as requests
 import ujson as json
@@ -11,6 +11,7 @@ import ntptime
 from config import *
 from oauth_handler import OAuth2Handler
 from logger import Logger
+from web_logger import WebLogger
 
 # Enable garbage collection
 gc.enable()
@@ -21,7 +22,7 @@ class MeetingLight:
         # Initialize logger first
         self.logger = Logger()
         self.logger.info("="*50)
-        self.logger.info("Meeting Light Controller Starting...")
+        self.logger.info("Meeting Light Controller Starting (with Web UI)...")
         self.logger.info(f"Free memory: {gc.mem_free()} bytes")
 
         # Initialize hardware
@@ -34,6 +35,7 @@ class MeetingLight:
         self.events_cache = []
         self.last_calendar_fetch = 0
         self.in_meeting = False
+        self.relay_state = "OFF"  # Track relay state for logging
         self.wifi_connected = False
         self.wifi_reconnect_attempts = 0
         self.wifi_reconnect_delay = 5  # Initial reconnect delay in seconds
@@ -52,6 +54,9 @@ class MeetingLight:
         except:
             self.logger.warning("Watchdog timer not available")
             self.wdt = None
+
+        # Initialize web logger
+        self.web_logger = WebLogger(self.logger, port=8080)
 
         # Connect to WiFi first
         self.connect_wifi()
@@ -86,6 +91,28 @@ class MeetingLight:
                 self.wdt.feed()
             except:
                 pass
+
+    def set_relay(self, state, reason=""):
+        """
+        Control relay with detailed logging
+        state: "ON" (light on) or "OFF" (light off)
+        reason: Why the relay is being changed
+        """
+        if state == "ON":
+            self.relay.off()  # Active-LOW: off() = relay ON
+            new_state = "ON"
+        else:
+            self.relay.on()  # Active-LOW: on() = relay OFF
+            new_state = "OFF"
+
+        # Only log if state actually changed
+        if new_state != self.relay_state:
+            self.relay_state = new_state
+            t = time.localtime()
+            timestamp = f"{t[3]:02d}:{t[4]:02d}:{t[5]:02d}"
+            self.logger.info(f"RELAY -> {new_state} ({reason}) at {timestamp}")
+
+        return new_state
 
     def connect_wifi(self, force_reconnect=False):
         """Connect to WiFi network with exponential backoff"""
@@ -137,6 +164,16 @@ class MeetingLight:
                 ip_info = self.wlan.ifconfig()
                 self.logger.info(f"WiFi connected! IP: {ip_info[0]}")
                 self.logger.info(f"Signal strength: {self.get_wifi_signal()} dBm")
+
+                # Start web server for remote log access
+                if self.web_logger.start():
+                    self.logger.info(f"Web UI available at: http://{ip_info[0]}:8080/")
+                    print(f"\n{'='*50}")
+                    print(f"WEB UI: http://{ip_info[0]}:8080/")
+                    print(f"{'='*50}\n")
+                else:
+                    self.logger.warning("Failed to start web server")
+
                 self.led.on()
                 time.sleep(1)
                 self.led.off()
@@ -446,7 +483,7 @@ class MeetingLight:
                 if not self.in_meeting:
                     self.logger.info(f"MEETING STARTED: {event['summary']}")
                     self.in_meeting = True
-                    self.relay.off()  # Active-LOW: off() = relay ON (light ON)
+                    self.set_relay("ON", f"Meeting: {event['summary']}")
                     self.led.on()  # Solid LED during meeting
                 return True
 
@@ -454,7 +491,7 @@ class MeetingLight:
         if self.in_meeting:
             self.logger.info("MEETING ENDED")
             self.in_meeting = False
-            self.relay.on()  # Active-LOW: on() = relay OFF (light OFF)
+            self.set_relay("OFF", "Meeting ended")
             self.led.off()
 
         return False
@@ -469,11 +506,12 @@ class MeetingLight:
 
     def error_flash(self):
         """Flash relay/LED to indicate error"""
-        for _ in range(3):
-            self.relay.off()  # Active-LOW: off() = relay ON
+        self.logger.warning("Error flash sequence triggered")
+        for i in range(3):
+            self.set_relay("ON", f"Error flash {i+1}/3")
             self.led.on()
             time.sleep(1)
-            self.relay.on()  # Active-LOW: on() = relay OFF
+            self.set_relay("OFF", f"Error flash {i+1}/3 end")
             self.led.off()
             time.sleep(1)
 
@@ -493,6 +531,10 @@ class MeetingLight:
         while True:
             try:
                 self.feed_watchdog()
+
+                # Check for web requests (non-blocking)
+                self.web_logger.check_requests()
+
                 current_time = time.time()
 
                 # Garbage collection every minute

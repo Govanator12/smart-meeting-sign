@@ -110,8 +110,9 @@ Using Thonny IDE:
    - `config.py` (settings)
    - `oauth_handler.py` (OAuth2 logic)
    - `logger.py` (logging system)
+   - `web_logger.py` (web UI for remote log access)
    - `main.py` (main program)
-   - `view_logs.py` (optional - for troubleshooting)
+   - `view_logs.py` (optional - for troubleshooting via USB)
 
 ### 5. First-Time Authorization
 
@@ -173,7 +174,9 @@ STATUS_CHECK_INTERVAL = 10      # How often to check cached events
 
 ### Viewing System Logs
 
-The system includes comprehensive logging to help diagnose issues. To view logs:
+The system includes comprehensive logging with **detailed relay state tracking** to help diagnose issues. Every relay state change is logged with precise timestamps and reasons.
+
+#### Option 1: USB Connection (Simplest)
 
 1. **In Thonny IDE**, run:
 ```python
@@ -188,20 +191,93 @@ exec(open('view_logs.py').read())
 
 The log analysis will show counts of errors, warnings, meeting events, and recent error messages with timestamps.
 
+#### Option 2: Remote Web Access (WiFi)
+
+**Access logs from any device on your network - enabled by default!**
+
+When the Pico W boots up, it automatically starts a web server. Look for this in the console output:
+```
+==================================================
+WEB UI: http://192.168.1.123:8080/
+==================================================
+```
+
+**Usage:**
+- Visit `http://<pico-ip>:8080/` in your browser from any device on your network
+- View last 50/100/200/500 log lines with color-coded entries
+- Check system health (memory, WiFi signal, time)
+- Auto-refresh option for real-time monitoring
+- **Historical logs** - see what happened in the past, not just current events!
+
+**Features:**
+- **Color-coded logs** - Errors in red, warnings in yellow, relay changes highlighted
+- **Non-blocking** - Doesn't interfere with meeting detection
+- **Minimal overhead** - 2-3 KB RAM when idle, 5-10 KB when serving a request
+- **Responsive design** - Works on phones and tablets
+- **Always available** - No setup required, works out of the box
+
+**Perfect for diagnosing relay clicks:** Hear a click → grab your phone → open the web UI → see exactly what triggered it!
+
+**Security Note:** Web UI is not password protected. Only use on trusted networks. Logs may contain meeting names/attendees.
+
+### Diagnosing Random Relay Clicks
+
+If you hear unexpected relay clicks, the enhanced logging can help identify the cause:
+
+**What the logs show:**
+```
+[2025-12-01 14:30:15] [INFO] RELAY -> ON (Meeting: Team Standup) at 14:30:15
+[2025-12-01 15:00:45] [INFO] RELAY -> OFF (Meeting ended) at 15:00:45
+[2025-12-01 15:05:12] [INFO] RELAY -> ON (Error flash 1/3) at 15:05:12
+```
+
+**How to investigate:**
+1. **Note the time** when you hear a click
+2. **Check logs** (via USB or web interface)
+3. **Search for "RELAY ->"** to see all state changes
+4. **Look at the timestamp and reason** for each change
+
+**Common causes of unexpected clicks:**
+- **Very short meetings** - Calendar events that start and end within seconds
+- **Calendar changes** - Events being rapidly added/removed while you're scheduling
+- **Time sync issues** - NTP sync causing time to jump forward/backward
+- **Error flash sequences** - System errors triggering the relay (check for ERROR/WARN messages)
+- **WiFi reconnections** - Network issues causing calendar refetch
+- **Meeting buffer overlap** - Two meetings close together with 2-minute buffers
+
+**If clicks happen with no log entry**, this may indicate a hardware issue with the relay module itself.
+
 ### Relay Issues
 
 #### **Light Turns ON at Startup (Active-HIGH Relay Fix)**
 If your LED sign turns ON immediately when you plug in the Pico, you have an Active-HIGH relay. You have two options:
 
 **Option 1: Software Fix (Recommended)**
-Modify all relay commands in `main.py`:
-- Find every `self.relay.on()` and change it to `self.relay.off()`
-- Find every `self.relay.off()` and change it to `self.relay.on()`
-- There are 6 locations to change:
-  - Line ~29: In `__init__` (startup state)
-  - Line ~264: When meeting starts
-  - Line ~272: When meeting ends  
-  - Lines ~286-289: Error flash function (2 changes)
+The code now uses a centralized `set_relay()` method, making this easier! Modify the `set_relay()` method in `main.py` (around line 91-111):
+
+Find this section:
+```python
+def set_relay(self, state, reason=""):
+    if state == "ON":
+        self.relay.off()  # Active-LOW: off() = relay ON
+        new_state = "ON"
+    else:
+        self.relay.on()  # Active-LOW: on() = relay OFF
+        new_state = "OFF"
+```
+
+Change it to:
+```python
+def set_relay(self, state, reason=""):
+    if state == "ON":
+        self.relay.on()  # Active-HIGH: on() = relay ON
+        new_state = "ON"
+    else:
+        self.relay.off()  # Active-HIGH: off() = relay OFF
+        new_state = "OFF"
+```
+
+That's it! All relay changes go through this single method, so this one fix handles everything.
 
 **Option 2: Hardware Fix**
 - Use the NC (Normally Closed) terminal instead of NO (Normally Open)
@@ -263,15 +339,16 @@ If the sign fails to turn on for meetings:
 
 ```
 /
-├── main.py                    # Main program logic with self-healing capabilities
+├── main.py                    # Main program logic with self-healing and relay state logging
 ├── config.py                  # User settings
 ├── config_secrets.py          # WiFi and OAuth credentials (create from template)
 ├── config_secrets_template.py # Template for secrets file
 ├── oauth_handler.py           # OAuth2 implementation
 ├── logger.py                  # Persistent logging system with rotation
 ├── view_logs.py               # Interactive log viewer utility
+├── web_logger.py              # Web server for remote log access (enabled by default)
 ├── oauth_token.json           # Saved auth token (auto-generated)
-└── meeting_light.log          # System event logs (auto-generated)
+└── meeting_light.log          # System event logs with relay state changes (auto-generated)
 ```
 
 ## Security Notes
@@ -280,6 +357,7 @@ If the sign fails to turn on for meetings:
 - OAuth tokens are stored locally on the Pico W
 - Calendar access is read-only
 - Refresh tokens persist indefinitely unless revoked
+- **Web UI (enabled by default)**: Not password protected - only use on trusted networks. Logs may contain meeting names/attendees. Don't expose port 8080 to the internet.
 
 ## Maintenance
 
