@@ -26,18 +26,26 @@ class MeetingLight:
         self.logger.info(f"Free memory: {gc.mem_free()} bytes")
 
         # Log reset cause for diagnostics
-        reset_cause = machine.reset_cause()
-        reset_reasons = {
-            machine.PWRON_RESET: "Power-on reset",
-            machine.HARD_RESET: "Hard reset (button press)",
-            machine.WDT_RESET: "Watchdog timer reset (system hang detected)",
-            machine.SOFT_RESET: "Soft reset (Ctrl+D or software reset)"
-        }
-        if hasattr(machine, 'DEEPSLEEP_RESET'):
-            reset_reasons[machine.DEEPSLEEP_RESET] = "Deep sleep wake"
+        try:
+            reset_cause = machine.reset_cause()
+            reset_reasons = {}
 
-        reset_reason = reset_reasons.get(reset_cause, f"Unknown reset cause: {reset_cause}")
-        self.logger.info(f"Reset cause: {reset_reason}")
+            # Only add reset reasons that exist on this platform
+            if hasattr(machine, 'PWRON_RESET'):
+                reset_reasons[machine.PWRON_RESET] = "Power-on reset"
+            if hasattr(machine, 'HARD_RESET'):
+                reset_reasons[machine.HARD_RESET] = "Hard reset (button press)"
+            if hasattr(machine, 'WDT_RESET'):
+                reset_reasons[machine.WDT_RESET] = "Watchdog timer reset (system hang detected)"
+            if hasattr(machine, 'SOFT_RESET'):
+                reset_reasons[machine.SOFT_RESET] = "Soft reset (Ctrl+D or software reset)"
+            if hasattr(machine, 'DEEPSLEEP_RESET'):
+                reset_reasons[machine.DEEPSLEEP_RESET] = "Deep sleep wake"
+
+            reset_reason = reset_reasons.get(reset_cause, f"Unknown reset cause: {reset_cause}")
+            self.logger.info(f"Reset cause: {reset_reason}")
+        except Exception as e:
+            self.logger.warning(f"Could not determine reset cause: {e}")
 
         # Initialize hardware
         self.relay = machine.Pin(RELAY_PIN, machine.Pin.OUT)
