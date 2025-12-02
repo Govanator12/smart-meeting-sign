@@ -89,6 +89,7 @@ class MeetingLight:
 
         # Initialize OAuth2 handler
         self.logger.info("Initializing OAuth2...")
+        self.feed_watchdog()
         try:
             self.oauth = OAuth2Handler(
                 CLIENT_ID,
@@ -96,15 +97,20 @@ class MeetingLight:
                 CALENDAR_SCOPE,
                 TOKEN_FILE
             )
+            self.feed_watchdog()
 
-            # Test OAuth2 connection
+            # Test OAuth2 connection (may make network request)
+            self.logger.info("Testing OAuth2 connection...")
             if not self.oauth.get_valid_token():
                 self.logger.error("Failed to authenticate with Google")
+                self.feed_watchdog()
                 self.error_flash()
             else:
                 self.logger.info("Google Calendar connected successfully!")
+            self.feed_watchdog()
         except Exception as e:
             self.logger.error(f"OAuth initialization failed: {e}")
+            self.feed_watchdog()
             self.error_flash()
 
     def feed_watchdog(self):
@@ -303,16 +309,21 @@ class MeetingLight:
 
         try:
             # Check WiFi before fetching
+            self.feed_watchdog()
             if not self.check_wifi_connection():
                 self.logger.error("Cannot fetch calendar - WiFi not connected")
                 return False
 
-            # Get valid OAuth2 token
+            # Get valid OAuth2 token (may trigger network refresh)
+            self.feed_watchdog()
+            self.logger.info("Getting OAuth token...")
             token = self.oauth.get_valid_token()
+            self.feed_watchdog()
             if not token:
                 self.logger.error("Could not get valid auth token")
                 self.consecutive_errors += 1
                 return False
+            self.logger.info("OAuth token acquired")
 
             # Get current time for date range (in UTC)
             now = time.localtime()
