@@ -70,10 +70,14 @@ class MeetingLight:
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
 
-        # Watchdog timer disabled - network operations (OAuth refresh) can take >8s
-        # which exceeds RP2040's max watchdog timeout, causing unnecessary resets
-        self.wdt = None
-        self.logger.info("Watchdog timer disabled (network operations may exceed 8s limit)")
+        # Initialize watchdog timer (8 seconds timeout)
+        # OAuth handler now feeds watchdog during network operations
+        try:
+            self.wdt = machine.WDT(timeout=8000)
+            self.logger.info("Watchdog timer initialized (8s timeout)")
+        except:
+            self.logger.warning("Watchdog timer not available")
+            self.wdt = None
 
         # Initialize web logger
         self.web_logger = WebLogger(self.logger, port=8080)
@@ -92,7 +96,8 @@ class MeetingLight:
                 CLIENT_ID,
                 CLIENT_SECRET,
                 CALENDAR_SCOPE,
-                TOKEN_FILE
+                TOKEN_FILE,
+                watchdog_callback=self.feed_watchdog
             )
             self.feed_watchdog()
 
