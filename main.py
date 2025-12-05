@@ -79,8 +79,8 @@ class MeetingLight:
             self.logger.warning("Watchdog timer not available")
             self.wdt = None
 
-        # Initialize web logger
-        self.web_logger = WebLogger(self.logger, port=8080)
+        # Initialize web logger with timezone from config
+        self.web_logger = WebLogger(self.logger, port=8080, timezone_offset=DISPLAY_TIMEZONE_OFFSET)
 
         # Connect to WiFi first
         self.connect_wifi()

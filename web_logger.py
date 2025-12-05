@@ -1,7 +1,8 @@
-# web_logger.py - Simple HTTP server for remote log access
+# web_logger.py - Simple HTTP server for remote log access with timezone support
 import socket
 import time
 import gc
+import re
 
 class WebLogger:
     """
@@ -9,10 +10,28 @@ class WebLogger:
     Access via: http://<pico-ip-address>:8080/
     """
 
-    def __init__(self, logger, port=8080):
+    # Common timezone definitions (offset in hours from UTC)
+    TIMEZONES = {
+        'UTC': 0,
+        'EST': -5,
+        'EDT': -4,
+        'CST': -6,
+        'CDT': -5,
+        'MST': -7,
+        'MDT': -6,
+        'PST': -8,
+        'PDT': -7,
+        'GMT': 0,
+        'CET': 1,
+        'JST': 9,
+        'AEST': 10,
+    }
+
+    def __init__(self, logger, port=8080, timezone_offset=0):
         self.logger = logger
         self.port = port
         self.socket = None
+        self.timezone_offset = timezone_offset  # Hours offset from UTC
 
     def start(self):
         """Start the web server (non-blocking)"""
@@ -30,6 +49,68 @@ class WebLogger:
         except Exception as e:
             print(f"Failed to start web logger: {e}")
             return False
+
+    def convert_timestamp(self, log_line, offset):
+        """Convert timestamp in log line from UTC to specified timezone offset"""
+        # Match timestamp pattern: [YYYY-MM-DD HH:MM:SS]
+        pattern = r'\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\]'
+        match = re.search(pattern, log_line)
+
+        if not match:
+            return log_line
+
+        try:
+            year = int(match.group(1))
+            month = int(match.group(2))
+            day = int(match.group(3))
+            hour = int(match.group(4))
+            minute = int(match.group(5))
+            second = int(match.group(6))
+
+            # Convert to epoch, add offset, convert back
+            # Note: This is a simplified conversion that doesn't handle DST or month boundaries perfectly
+            new_hour = hour + offset
+            new_day = day
+            new_month = month
+            new_year = year
+
+            # Handle day overflow/underflow
+            if new_hour >= 24:
+                new_hour -= 24
+                new_day += 1
+            elif new_hour < 0:
+                new_hour += 24
+                new_day -= 1
+
+            # Handle month overflow (simplified - assumes 28-31 days)
+            days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            if new_day > days_in_month[month - 1]:
+                new_day = 1
+                new_month += 1
+                if new_month > 12:
+                    new_month = 1
+                    new_year += 1
+            elif new_day < 1:
+                new_month -= 1
+                if new_month < 1:
+                    new_month = 12
+                    new_year -= 1
+                new_day = days_in_month[new_month - 1]
+
+            new_timestamp = f"[{new_year:04d}-{new_month:02d}-{new_day:02d} {new_hour:02d}:{minute:02d}:{second:02d}]"
+            return log_line.replace(match.group(0), new_timestamp)
+        except:
+            return log_line
+
+    def get_timezone_name(self, offset):
+        """Get timezone name from offset"""
+        for name, tz_offset in self.TIMEZONES.items():
+            if tz_offset == offset:
+                return name
+        if offset >= 0:
+            return f"UTC+{offset}"
+        else:
+            return f"UTC{offset}"
 
     def check_requests(self):
         """Check for incoming requests (call this in your main loop)"""
@@ -54,20 +135,32 @@ class WebLogger:
                 if len(lines) > 0:
                     path = lines[0].split()[1] if len(lines[0].split()) > 1 else '/'
 
+                    # Parse query parameters for timezone
+                    tz_offset = self.timezone_offset
+                    if '?' in path:
+                        path_part, query = path.split('?', 1)
+                        for param in query.split('&'):
+                            if param.startswith('tz='):
+                                try:
+                                    tz_offset = int(param.split('=')[1])
+                                except:
+                                    pass
+                        path = path_part
+
                     # Route the request
                     if path == '/' or path == '/logs':
-                        self.serve_logs(cl, lines=100)
+                        self.serve_logs(cl, lines=100, tz_offset=tz_offset)
                     elif path.startswith('/logs/'):
                         # Extract line count from path like /logs/200
                         try:
                             num_lines = int(path.split('/')[2])
-                            self.serve_logs(cl, lines=num_lines)
+                            self.serve_logs(cl, lines=num_lines, tz_offset=tz_offset)
                         except:
-                            self.serve_logs(cl, lines=100)
+                            self.serve_logs(cl, lines=100, tz_offset=tz_offset)
                     elif path == '/logs/live':
                         self.serve_live_logs(cl)
                     elif path == '/health':
-                        self.serve_health(cl)
+                        self.serve_health(cl, tz_offset=tz_offset)
                     else:
                         self.serve_404(cl)
             except Exception as e:
@@ -82,10 +175,21 @@ class WebLogger:
         except Exception as e:
             print(f"Web server error: {e}")
 
-    def serve_logs(self, client, lines=100):
-        """Serve log file contents as HTML"""
+    def serve_logs(self, client, lines=100, tz_offset=None):
+        """Serve log file contents as HTML with timezone conversion"""
+        if tz_offset is None:
+            tz_offset = self.timezone_offset
+
         try:
             logs = self.logger.get_logs(lines=lines)
+            tz_name = self.get_timezone_name(tz_offset)
+
+            # Build timezone selector options
+            tz_options = ""
+            for name, offset in sorted(self.TIMEZONES.items(), key=lambda x: x[1]):
+                selected = "selected" if offset == tz_offset else ""
+                sign = "+" if offset >= 0 else ""
+                tz_options += f'<option value="{offset}" {selected}>{name} (UTC{sign}{offset})</option>\n'
 
             html = f"""HTTP/1.1 200 OK
 Content-Type: text/html
@@ -111,37 +215,57 @@ Connection: close
         .INFO {{ color: #4fc1ff; }}
         .DEBUG {{ color: #b5cea8; }}
         .nav {{ margin: 20px 0; }}
-        .nav a {{
+        .nav a, .nav select {{
             color: #4ec9b0;
             margin-right: 15px;
             text-decoration: none;
             padding: 5px 10px;
             border: 1px solid #4ec9b0;
             border-radius: 3px;
+            background: #1e1e1e;
         }}
         .nav a:hover {{ background: #2d2d30; }}
+        .nav select {{ cursor: pointer; }}
         .timestamp {{ color: #858585; }}
         .relay {{ color: #ce9178; font-weight: bold; }}
+        .tz-label {{ color: #858585; margin-right: 5px; }}
+        .tz-display {{ color: #dcdcaa; font-weight: bold; }}
     </style>
+    <script>
+        function changeTimezone(offset) {{
+            var url = window.location.pathname;
+            window.location.href = url + '?tz=' + offset;
+        }}
+    </script>
 </head>
 <body>
     <h1>Meeting Light Logs</h1>
     <div class="nav">
-        <a href="/logs/50">Last 50</a>
-        <a href="/logs/100">Last 100</a>
-        <a href="/logs/200">Last 200</a>
-        <a href="/logs/500">Last 500</a>
-        <a href="/health">Health</a>
-        <a href="/" onclick="location.reload(); return false;">Refresh</a>
+        <a href="/logs/50?tz={tz_offset}">Last 50</a>
+        <a href="/logs/100?tz={tz_offset}">Last 100</a>
+        <a href="/logs/200?tz={tz_offset}">Last 200</a>
+        <a href="/logs/500?tz={tz_offset}">Last 500</a>
+        <a href="/health?tz={tz_offset}">Health</a>
+        <a href="#" onclick="location.reload(); return false;">Refresh</a>
+    </div>
+    <div style="margin: 15px 0;">
+        <span class="tz-label">Timezone:</span>
+        <select onchange="changeTimezone(this.value)">
+            {tz_options}
+        </select>
+        <span class="tz-display" style="margin-left: 10px;">Showing times in {tz_name}</span>
     </div>
     <div>Showing last {lines} lines (most recent at bottom):</div>
     <hr>
     <div class="logs">
 """
 
-            # Add log lines with syntax highlighting
+            # Add log lines with syntax highlighting and timezone conversion
             for line in logs:
                 line = line.rstrip()
+
+                # Convert timestamp to selected timezone
+                line = self.convert_timestamp(line, tz_offset)
 
                 # Highlight relay changes
                 if "RELAY ->" in line:
@@ -175,8 +299,11 @@ Connection: close
             print(f"Error serving logs: {e}")
             self.serve_error(client, str(e))
 
-    def serve_health(self, client):
+    def serve_health(self, client, tz_offset=None):
         """Serve system health information"""
+        if tz_offset is None:
+            tz_offset = self.timezone_offset
+
         try:
             import machine
 
@@ -191,6 +318,11 @@ Connection: close
                 log_size = stat[6]
             except:
                 pass
+
+            # Get current time and convert to display timezone
+            t = time.localtime()
+            display_hour = (t[3] + tz_offset) % 24
+            tz_name = self.get_timezone_name(tz_offset)
 
             html = f"""HTTP/1.1 200 OK
 Content-Type: text/html
@@ -228,7 +360,7 @@ Connection: close
 </head>
 <body>
     <h1>System Health</h1>
-    <div class="nav"><a href="/logs">View Logs</a></div>
+    <div class="nav"><a href="/logs?tz={tz_offset}">View Logs</a></div>
     <div class="metric">
         <div class="label">Free Memory</div>
         <div class="value">{free_mem:,} bytes</div>
@@ -239,7 +371,11 @@ Connection: close
     </div>
     <div class="metric">
         <div class="label">Current Time (UTC)</div>
-        <div class="value">{time.localtime()}</div>
+        <div class="value">{t[0]}-{t[1]:02d}-{t[2]:02d} {t[3]:02d}:{t[4]:02d}:{t[5]:02d}</div>
+    </div>
+    <div class="metric">
+        <div class="label">Current Time ({tz_name})</div>
+        <div class="value">{t[0]}-{t[1]:02d}-{t[2]:02d} {display_hour:02d}:{t[4]:02d}:{t[5]:02d}</div>
     </div>
 </body>
 </html>

@@ -20,6 +20,10 @@ CALENDAR_REFRESH_INTERVAL = 900  # 15 minutes
 STATUS_CHECK_INTERVAL = 10  # 10 seconds
 MEETING_BUFFER_MINUTES = 2  # Turn on 2 min early, off 2 min late
 
+# Display Settings
+# Timezone offset in hours from UTC (e.g., -5 for EST, -8 for PST, 0 for UTC)
+DISPLAY_TIMEZONE_OFFSET = -5  # Default to EST
+
 # Calendar Filters
 IGNORE_DECLINED = True
 IGNORE_ALL_DAY = True
